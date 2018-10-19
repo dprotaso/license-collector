@@ -13,7 +13,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
@@ -70,55 +69,39 @@ func main() {
 	printLicenses(imageName, layers, licenseRefs)
 }
 
-func collectCommonLicenses(layers []v1.Layer) map[string]string {
+func collectCommonLicenses(layers ImageLayers) map[string]string {
 	licenses := make(map[string]string)
 
 	// This code naively assumes if a license links to another
 	// it's in the same path
 	links := make(map[string]string)
 
-	for _, layer := range layers {
-		ul, err := layer.Uncompressed()
+	err := layers.Walk(func(hdr *tar.Header, r io.Reader) error {
+		for _, location := range CommonLicensesLocation {
+			cleanPath := strings.TrimPrefix(hdr.Name, ".")
 
-		if err != nil {
-			log.Fatalf("unable to fetch uncompresed image layer: %v", err)
-		}
-
-		tr := tar.NewReader(ul)
-
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break // End of archive
+			if !strings.HasPrefix(cleanPath, location) {
+				continue
 			}
+
+			if hdr.Typeflag == tar.TypeLink || hdr.Typeflag == tar.TypeSymlink {
+				links[cleanPath] = filepath.Join(location, hdr.Linkname)
+			}
+
+			licenseText, err := ioutil.ReadAll(r)
+
 			if err != nil {
 				log.Fatalf("unable to read next file: %v", err)
 			}
 
-			if hdr.FileInfo().IsDir() {
-				continue
-			}
-
-			for _, location := range CommonLicensesLocation {
-				cleanPath := strings.TrimPrefix(hdr.Name, ".")
-
-				if !strings.HasPrefix(cleanPath, location) {
-					continue
-				}
-
-				if hdr.Typeflag == tar.TypeLink || hdr.Typeflag == tar.TypeSymlink {
-					links[cleanPath] = filepath.Join(location, hdr.Linkname)
-				}
-
-				licenseText, err := ioutil.ReadAll(tr)
-
-				if err != nil {
-					log.Fatalf("unable to read next file: %v", err)
-				}
-
-				licenses[cleanPath] = string(licenseText)
-			}
+			licenses[cleanPath] = string(licenseText)
 		}
+
+		return nil
+	})
+
+	if err != nil {
+		log.Fatalf("Unable to collect common licenses: %v", err)
 	}
 
 	for source, target := range links {
@@ -128,35 +111,15 @@ func collectCommonLicenses(layers []v1.Layer) map[string]string {
 	return licenses
 }
 
-func printLicenses(imageName string, layers []v1.Layer, licenseRefs map[string]string) {
-	for _, layer := range layers {
-		ul, err := layer.Uncompressed()
-		if err != nil {
-			log.Fatalf("unable to fetch uncompresed image layer: %v", err)
-		}
-
-		tr := tar.NewReader(ul)
-		for {
-			hdr, err := tr.Next()
-			if err == io.EOF {
-				break // End of archive
-			}
-			if err != nil {
-				log.Fatalf("unable to read next file: %v", err)
-			}
-
-			if hdr.FileInfo().IsDir() {
-				continue
-			}
-
-			for _, name := range LicenseNames {
-				if strings.HasSuffix(hdr.Name, name) {
-					printLicense(imageName, hdr.Name, tr, licenseRefs)
-				}
+func printLicenses(imageName string, layers ImageLayers, licenseRefs map[string]string) {
+	layers.Walk(func(hdr *tar.Header, r io.Reader) error {
+		for _, name := range LicenseNames {
+			if strings.HasSuffix(hdr.Name, name) {
+				printLicense(imageName, hdr.Name, r, licenseRefs)
 			}
 		}
-	}
-
+		return nil
+	})
 }
 
 func printLicense(img string, filepath string, reader io.Reader, licenseRefs map[string]string) {
@@ -172,7 +135,7 @@ func printLicense(img string, filepath string, reader io.Reader, licenseRefs map
 	for scanner.Scan() {
 		text := scanner.Text()
 
-		for licensePath, _ := range licenseRefs {
+		for licensePath := range licenseRefs {
 			if strings.Contains(text, licensePath) {
 				detectedLicensesRefs = append(detectedLicensesRefs, licensePath)
 			}
